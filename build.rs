@@ -21,6 +21,7 @@ fn main() {
 
     let g1 = include_bytes!(src!());
 
+    // see https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html#validation-process
     let want = test::from_hex("8cf60e2b2efca96c6a9e71e851d00c1b6991cc09eadbe64a6a1d1b1eb9faff7c")
         .expect("failed to parse g1 hash");
     let have = digest::digest(&SHA256, g1);

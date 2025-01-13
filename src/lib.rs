@@ -115,6 +115,13 @@ impl UnparsedAttestationDoc<'_> {
         Ok(cn)
     }
 
+    /// Parse and verify the attestation document.
+    ///
+    /// - Verify root certificate fingerprint is correct, using the official G1 certificate bundle (see `build.rs` for bootstrapping)
+    /// - Verify certificate chain signatures
+    /// - Verify usage of correct signing algorithm (pinned to `ECDSA_WITH_SHA384`)
+    /// - Verify validity fields (not before, not after)
+    /// - Verify COSE signature
     pub fn parse_and_verify(&self, now: OffsetDateTime) -> Result<AttestationDoc> {
         let document =
             CoseSign1::from_slice(self.0).map_err(|e| Error::CoseSignatureMalformed(e))?;
