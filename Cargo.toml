@@ -1,0 +1,27 @@
+[package]
+name = "nitro_attest"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+ring = { version = "0.17", features = ["std"] }
+x509-parser = { version = "0.16" }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[dependencies]
+aws-nitro-enclaves-nsm-api = { version = "0.4", default-features = false }
+coset = { version = "0.3", features = ["std"] }
+hex = "0.4.3"
+ring = "0.17"
+serde_cbor = "0.11"
+thiserror = "2"
+time = "0.3"
+tracing = "0.1"
+x509-parser = { version = "0.16", features = ["verify", "validate"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+time = { version = "0.3", features = ["wasm-bindgen"] }
