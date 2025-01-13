@@ -110,7 +110,7 @@ impl UnparsedAttestationDoc<'_> {
             .next()
             .ok_or(Error::CommonNameMissing)?;
 
-        let cn = cn.as_str().map_err(|e| Error::CommonNameMalformed(e))?;
+        let cn = cn.as_str().map_err(Error::CommonNameMalformed)?;
 
         Ok(cn)
     }
@@ -123,8 +123,7 @@ impl UnparsedAttestationDoc<'_> {
     /// - Verify validity fields (not before, not after)
     /// - Verify COSE signature
     pub fn parse_and_verify(&self, now: OffsetDateTime) -> Result<AttestationDoc> {
-        let document =
-            CoseSign1::from_slice(self.0).map_err(|e| Error::CoseSignatureMalformed(e))?;
+        let document = CoseSign1::from_slice(self.0).map_err(Error::CoseSignatureMalformed)?;
 
         let payload = document.payload.as_ref().ok_or(Error::CosePayloadMissing)?;
 
@@ -146,17 +145,17 @@ impl UnparsedAttestationDoc<'_> {
             .try_fold(None, |parent, (idx, cert)| {
                 let (_, x509) = X509Certificate::from_der(cert).map_err(|e| match e {
                     x509_parser::nom::Err::Incomplete(_) => Error::CertificateMalformed {
-                        idx: idx,
+                        idx,
                         incomplete: true,
                         source: None,
                     },
                     x509_parser::nom::Err::Error(e) => Error::CertificateMalformed {
-                        idx: idx,
+                        idx,
                         incomplete: false,
                         source: Some(e),
                     },
                     x509_parser::nom::Err::Failure(e) => Error::CertificateMalformed {
-                        idx: idx,
+                        idx,
                         incomplete: false,
                         source: Some(e),
                     },
@@ -180,7 +179,7 @@ impl UnparsedAttestationDoc<'_> {
                 if alg != &OID_SIG_ECDSA_WITH_SHA384 {
                     return Err(Error::CertificateUnexpectedAlgorithm {
                         cn: cn.to_owned(),
-                        idx: idx,
+                        idx,
                         oid: alg.to_owned(),
                     });
                 }
@@ -200,7 +199,7 @@ impl UnparsedAttestationDoc<'_> {
                         x509.verify_signature(Some(parent.public_key()))
                             .map_err(|e| Error::CertificateSignatureInvalid {
                                 cn: cn.to_string(),
-                                idx: idx,
+                                idx,
                                 source: e,
                             })?;
                     }
@@ -230,8 +229,8 @@ impl UnparsedAttestationDoc<'_> {
                 if now > not_after {
                     return Err(Error::CertificateExpired {
                         cn: cn.to_string(),
-                        idx: idx,
-                        now: now,
+                        idx,
+                        now,
                         then: not_after,
                     });
                 }
@@ -241,8 +240,8 @@ impl UnparsedAttestationDoc<'_> {
                 if now < not_before {
                     return Err(Error::CertificateNotYetValid {
                         cn: cn.to_string(),
-                        idx: idx,
-                        now: now,
+                        idx,
+                        now,
                         then: not_before,
                     });
                 }
