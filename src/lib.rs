@@ -1,10 +1,13 @@
+pub use serde_bytes::ByteBuf;
+
 use ::time::OffsetDateTime;
-pub use aws_nitro_enclaves_nsm_api::api::AttestationDoc; // TODO: internalize this and expose the X509 certificate
 use coset::{CborSerializable, CoseError, CoseSign1};
 use ring::{
     digest::{self, SHA256},
     signature::{UnparsedPublicKey, ECDSA_P384_SHA384_FIXED},
 };
+use std::collections::BTreeMap;
+use std::iter::once;
 use thiserror::Error;
 use tracing::debug;
 use x509_parser::{
@@ -16,8 +19,41 @@ use x509_parser::{
 
 const ROOT_FINGERPRINT: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
-    "/AWS_NitroEnclaves_Root-G1.zip.root.pem.sha256"
+    "/AWS_NitroEnclaves_Root-G1.zip.root.pem.sha256" // TODO: better naming
 ));
+
+#[derive(Debug)]
+pub enum Digest {
+    SHA256,
+    SHA384,
+    SHA512,
+}
+
+#[derive(Debug)]
+pub struct AttestationDoc {
+    // /// Issuing NSM ID
+    pub module_id: String,
+
+    // /// The digest function used for calculating the register values
+    // /// Can be: "SHA256" | "SHA512"
+    pub digest: Digest,
+
+    /// Time when document was created
+    pub timestamp: OffsetDateTime,
+
+    /// Map of all locked PCRs at the moment the attestation document was generated
+    pub pcrs: BTreeMap<usize, ByteBuf>,
+
+    /// An optional DER-encoded key the attestation consumer can use to encrypt data with
+    pub public_key: Option<ByteBuf>,
+
+    /// Additional signed user data, as defined by protocol.
+    pub user_data: Option<ByteBuf>,
+
+    /// An optional cryptographic nonce provided by the attestation consumer as a proof of
+    /// authenticity.
+    pub nonce: Option<ByteBuf>,
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -93,18 +129,22 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
-pub struct UnparsedAttestationDoc<'a>(&'a [u8]);
+struct Cert<'a> {
+    cert: &'a [u8],
+    idx: usize,
+    x509: X509Certificate<'a>,
+}
 
-impl<'a> From<&'a [u8]> for UnparsedAttestationDoc<'a> {
-    fn from(val: &'a [u8]) -> Self {
-        UnparsedAttestationDoc(val)
+impl<'a> AsRef<[u8]> for Cert<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.cert
     }
 }
 
-impl UnparsedAttestationDoc<'_> {
-    fn cn<'a>(x509: &'a X509Certificate) -> Result<&'a str> {
-        let cn = x509
+impl<'a> Cert<'a> {
+    fn cn(&'a self) -> Result<&'a str> {
+        let cn = self
+            .x509
             .subject()
             .iter_common_name()
             .next()
@@ -115,34 +155,137 @@ impl UnparsedAttestationDoc<'_> {
         Ok(cn)
     }
 
-    /// Parse and verify the attestation document.
-    ///
-    /// - Verify root certificate fingerprint is correct, using the official G1 certificate bundle (see `build.rs` for bootstrapping)
-    /// - Verify certificate chain signatures
-    /// - Verify usage of correct signing algorithm (pinned to `ECDSA_WITH_SHA384`)
-    /// - Verify validity fields (not before, not after)
-    /// - Verify COSE signature
-    pub fn parse_and_verify(&self, now: OffsetDateTime) -> Result<AttestationDoc> {
-        let document = CoseSign1::from_slice(self.0).map_err(Error::CoseSignatureMalformed)?;
+    // TODO: move root here
+    fn fingerprint(&self) -> ring::digest::Digest {
+        digest::digest(&SHA256, self.cert)
+    }
 
-        let payload = document.payload.as_ref().ok_or(Error::CosePayloadMissing)?;
-
-        let doc = AttestationDoc::from_binary(payload).map_err(|e| match e {
-            aws_nitro_enclaves_nsm_api::api::Error::Cbor(e) => {
-                Error::CosePayloadMalformed { source: Some(e) }
-            }
-            _ => Error::CosePayloadMalformed { source: None },
+    fn parse(cert: &'a [u8], idx: usize) -> Result<Self> {
+        let (_, x509) = X509Certificate::from_der(cert).map_err(|e| match e {
+            x509_parser::nom::Err::Incomplete(_) => Error::CertificateMalformed {
+                idx,
+                incomplete: true,
+                source: None,
+            },
+            x509_parser::nom::Err::Error(e) => Error::CertificateMalformed {
+                idx,
+                incomplete: false,
+                source: Some(e),
+            },
+            x509_parser::nom::Err::Failure(e) => Error::CertificateMalformed {
+                idx,
+                incomplete: false,
+                source: Some(e),
+            },
         })?;
 
-        // verify offline by inspecting with openssl (e.g. xxd -r -p | openssl x509 -inform DER -text -noout)
-        debug!("decode and verify certificates");
+        let mut logger = VecLogger::default();
+        let ok = X509StructureValidator.validate(&x509, &mut logger);
 
-        let cert = doc
-            .cabundle
+        if !ok {
+            return Err(Error::CertificateMalformedStructure { idx, logger });
+        }
+
+        Ok(Self { cert, idx, x509 })
+    }
+
+    fn public_key(&'a self) -> &'a SubjectPublicKeyInfo<'a> {
+        self.x509.public_key()
+    }
+
+    fn validate(&self, now: OffsetDateTime) -> Result<()> {
+        let not_after = self.x509.validity.not_after.to_datetime();
+
+        if now > not_after {
+            return Err(Error::CertificateExpired {
+                cn: self.cn()?.into(),
+                idx: self.idx,
+                now,
+                then: not_after,
+            });
+        }
+
+        let not_before = self.x509.validity.not_before.to_datetime();
+
+        if now < not_before {
+            return Err(Error::CertificateNotYetValid {
+                cn: self.cn()?.into(),
+                idx: self.idx,
+                now,
+                then: not_before,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn verify(&self, parent: Option<&Cert>) -> Result<()> {
+        let cn = self.cn()?;
+        let cert = self.cert;
+        let idx = self.idx;
+
+        match parent {
+            Some(parent) => {
+                debug!(
+                    cert,
+                    cn,
+                    parent_cn = parent.cn()?,
+                    idx,
+                    "validating certificate by parent signature"
+                );
+
+                // TODO: test what happens if no signature and / or public key is present
+
+                self.x509
+                    .verify_signature(Some(parent.public_key()))
+                    .map_err(|e| Error::CertificateSignatureInvalid {
+                        cn: cn.into(),
+                        idx: self.idx,
+                        source: e,
+                    })?;
+            }
+            None => {
+                debug!(
+                    cert,
+                    cn, idx, "validating root certificate by embedded fingerprint"
+                );
+
+                let want = ROOT_FINGERPRINT;
+                let have = self.fingerprint(); // TODO: fix usage of contents equivalent
+
+                if have.as_ref() != want {
+                    return Err(Error::CertificateRootInvalid {
+                        have: hex::encode(have.as_ref()),
+                        want: hex::encode(want),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct UnparsedAttestationDoc<'a>(&'a [u8]);
+
+impl<'a> From<&'a [u8]> for UnparsedAttestationDoc<'a> {
+    fn from(val: &'a [u8]) -> Self {
+        UnparsedAttestationDoc(val)
+    }
+}
+
+impl UnparsedAttestationDoc<'_> {
+    /// Convert a bundle of DER encoded certificates and a DER encoded leaf certificate into a vector of
+    /// X509Certificate objects.
+    fn parse_certificates<'a>(
+        cabundle: &'a [ByteBuf],
+        cert: &'a ByteBuf,
+    ) -> Result<Vec<X509Certificate<'a>>> {
+        let bundle = cabundle
             .iter()
-            .chain(vec![&doc.certificate])
+            .chain(once(cert))
             .enumerate()
-            .try_fold(None, |parent, (idx, cert)| {
+            .map(|(idx, cert)| {
                 let (_, x509) = X509Certificate::from_der(cert).map_err(|e| match e {
                     x509_parser::nom::Err::Incomplete(_) => Error::CertificateMalformed {
                         idx,
@@ -163,92 +306,156 @@ impl UnparsedAttestationDoc<'_> {
 
                 // validate integrity before any other checks
                 let mut logger = VecLogger::default();
+
+                // validate integrity before any other checks
+                let mut logger = VecLogger::default();
                 let ok = X509StructureValidator.validate(&x509, &mut logger);
 
                 if !ok {
                     return Err(Error::CertificateMalformedStructure { idx, logger });
                 }
 
-                // this is just for information purposes - the cn is not validated yet
-                // TODO: potentially flag this in the tracing keys
-                let cn = Self::cn(&x509)?;
+                Ok(x509)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-                // ensure algorithm before doing signature checks
-                let alg = x509.signature_algorithm.oid();
+        Ok(bundle)
+    }
 
-                if alg != &OID_SIG_ECDSA_WITH_SHA384 {
-                    return Err(Error::CertificateUnexpectedAlgorithm {
-                        cn: cn.to_owned(),
+    fn parse_cn<'a>(x509: &'a X509Certificate) -> Result<&'a str> {
+        let cn = x509
+            .subject()
+            .iter_common_name()
+            .next()
+            .ok_or(Error::CommonNameMissing)?;
+
+        let cn = cn.as_str().map_err(Error::CommonNameMalformed)?;
+
+        Ok(cn)
+    }
+
+    fn verify_certificate_signature(
+        parent: Option<&X509Certificate>,
+        x509: &X509Certificate,
+        idx: usize,
+    ) -> Result<()> {
+        // ensure algorithm before doing signature checks
+        let alg = x509.signature_algorithm.oid();
+
+        if alg != &OID_SIG_ECDSA_WITH_SHA384 {
+            return Err(Error::CertificateUnexpectedAlgorithm {
+                cn: Self::parse_cn(&x509)?.into(),
+                idx,
+                oid: alg.to_owned(),
+            });
+        }
+
+        // we use hex to make it simpler to copy & paste when logging via console.log
+        let cert = hex::encode(x509.as_ref());
+        let cn = Self::parse_cn(&x509)?; // TODO: flag this in trace keys
+
+        match parent {
+            Some(parent) => {
+                let parent_cn = Self::parse_cn(&parent)?;
+
+                debug!(
+                    cert = cert,
+                    cn = debug(cn),
+                    parent_cn = debug(parent_cn),
+                    idx = idx,
+                    "validating certificate by parent signature"
+                );
+
+                // TODO: test what happens if no signature and / or public key is present
+                x509.verify_signature(Some(parent.public_key()))
+                    .map_err(|e| Error::CertificateSignatureInvalid {
+                        cn: cn.into(),
                         idx,
-                        oid: alg.to_owned(),
-                    });
+                        source: e,
+                    })?;
+            }
+            None => {
+                debug!(
+                    cert,
+                    cn = debug(cn),
+                    idx,
+                    "validating root certificate by embedded fingerprint"
+                );
+
+                // let want = ROOT_FINGERPRINT;
+                // let have = digest::digest(&SHA256, x509.as_ref()); // TODO: fix usage of contents equivalent
+
+                // if have.as_ref() != want {
+                //     return Err(Error::CertificateRootInvalid {
+                //         have: hex::encode(have.as_ref()),
+                //         want: hex::encode(want),
+                //     });
+                // }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn verify_certificate_validity(
+        x509: &X509Certificate,
+        idx: usize,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let not_after = x509.validity.not_after.to_datetime();
+
+        if now > not_after {
+            return Err(Error::CertificateExpired {
+                cn: Self::parse_cn(x509)?.into(),
+                idx,
+                now,
+                then: not_after,
+            });
+        }
+
+        let not_before = x509.validity.not_before.to_datetime();
+
+        if now < not_before {
+            return Err(Error::CertificateNotYetValid {
+                cn: Self::parse_cn(x509)?.into(),
+                idx,
+                now,
+                then: not_before,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn parse_and_verify<'a>(&'a self, now: OffsetDateTime) -> Result<AttestationDoc> {
+        let document = CoseSign1::from_slice(self.0).map_err(Error::CoseSignatureMalformed)?;
+
+        let payload = document.payload.as_ref().ok_or(Error::CosePayloadMissing)?;
+
+        let doc = aws_nitro_enclaves_nsm_api::api::AttestationDoc::from_binary(payload.as_slice())
+            .map_err(|e| match e {
+                aws_nitro_enclaves_nsm_api::api::Error::Cbor(e) => {
+                    Error::CosePayloadMalformed { source: Some(e) }
                 }
+                _ => Error::CosePayloadMalformed { source: None },
+            })?;
 
-                // we use hex to make it simpler to copy & paste when logging via console.log
-                match parent {
-                    Some(parent) => {
-                        debug!(
-                            cert = hex::encode(cert),
-                            cn = debug(cn),
-                            parent_cn = debug(Self::cn(&parent)?),
-                            idx = idx,
-                            "validating certificate by parent signature"
-                        );
+        // verify offline by inspecting with openssl (e.g. xxd -r -p | openssl x509 -inform DER -text -noout)
+        debug!("decode and verify certificates");
 
-                        // TODO: test what happens if no signature and / or public key is present
-                        x509.verify_signature(Some(parent.public_key()))
-                            .map_err(|e| Error::CertificateSignatureInvalid {
-                                cn: cn.to_string(),
-                                idx,
-                                source: e,
-                            })?;
-                    }
-                    None => {
-                        debug!(
-                            cert = hex::encode(cert),
-                            cn = debug(cn),
-                            idx = idx,
-                            "validating root certificate by embedded fingerprint"
-                        );
+        let certs = Self::parse_certificates(&doc.cabundle, &doc.certificate)?;
 
-                        let want = ROOT_FINGERPRINT;
-                        let have = digest::digest(&SHA256, cert);
+        let cert = certs
+            .into_iter()
+            .enumerate()
+            .try_fold::<Option<X509Certificate>, _, Result<_>>(None, |parent, (idx, x509)| {
+                Self::verify_certificate_signature(parent.as_ref(), &x509, idx)?;
+                Self::verify_certificate_validity(&x509, idx, now)?;
+                std::fs::write(format!("{}.der", idx), x509.as_ref()).unwrap();
 
-                        if have.as_ref() != want {
-                            return Err(Error::CertificateRootInvalid {
-                                have: hex::encode(have.as_ref()),
-                                want: hex::encode(want),
-                            });
-                        }
-                    }
-                }
+                println!("wrote {}.der", idx);
 
-                // check for validity after signature check to allow a chance to debug
-                let not_after = x509.validity.not_after.to_datetime();
-
-                if now > not_after {
-                    return Err(Error::CertificateExpired {
-                        cn: cn.to_string(),
-                        idx,
-                        now,
-                        then: not_after,
-                    });
-                }
-
-                let not_before = x509.validity.not_before.to_datetime();
-
-                if now < not_before {
-                    return Err(Error::CertificateNotYetValid {
-                        cn: cn.to_string(),
-                        idx,
-                        now,
-                        then: not_before,
-                    });
-                }
-
-                let next = Some(x509);
-
-                Ok::<Option<X509Certificate<'_>>, Error>(next)
+                Ok(Some(x509))
             })?
             .ok_or(Error::NoCertificatesFound)?;
 
@@ -265,6 +472,51 @@ impl UnparsedAttestationDoc<'_> {
                 .map_err(|_| Error::CoseSignatureVerificationFailed())
         })?;
 
+        let doc = AttestationDoc {
+            module_id: doc.module_id,
+            digest: match doc.digest {
+                aws_nitro_enclaves_nsm_api::api::Digest::SHA256 => Digest::SHA256,
+                aws_nitro_enclaves_nsm_api::api::Digest::SHA384 => Digest::SHA384,
+                aws_nitro_enclaves_nsm_api::api::Digest::SHA512 => Digest::SHA512,
+            },
+            timestamp: OffsetDateTime::from_unix_timestamp(doc.timestamp as i64).unwrap(), // TODO: add an error
+            pcrs: doc.pcrs,
+            public_key: doc.public_key,
+            user_data: doc.user_data,
+            nonce: doc.nonce,
+        };
+
         Ok(doc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    fn init() -> () {}
+
+    #[test]
+    fn test_parse_ca() {
+
+        // let cert= X509Certificate {
+        //     tbs_certificate: TbsCertificate {}
+        // }:
+
+        // // TODO: add entire bundle from attestation.cose
+
+        // let cabundle = vec![];
+
+        // let cert = ByteBuf::from(CERTIFICATE);
+
+        // let certs = UnparsedAttestationDoc::parse_certificates(&cabundle, &cert).unwrap();
+
+        // assert_eq!(certs.len(), 1);
+        // assert_eq!(certs[0].subject().to_string(), "C=US, ST=Washington, L=Seattle, O=Amazon, OU=AWS, CN=i-0bee92034f3d60691-enc01943c5eaab3ad6a.eu-central-1.aws");
+        // assert_eq!(
+        //     UnparsedAttestationDoc::parse_cn(&certs[0]).unwrap(),
+        //     "i-0bee92034f3d60691-enc01943c5eaab3ad6a.eu-central-1.aws"
+        // );
     }
 }
