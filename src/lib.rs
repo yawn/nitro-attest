@@ -17,12 +17,7 @@ use x509_parser::{
     validate::X509StructureValidator,
 };
 
-const ROOT_FINGERPRINT: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/AWS_NitroEnclaves_Root-G1.zip.root.pem.sha256" // TODO: better naming
-));
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Digest {
     SHA256,
     SHA384,
@@ -31,20 +26,19 @@ pub enum Digest {
 
 #[derive(Debug)]
 pub struct AttestationDoc {
-    // /// Issuing NSM ID
+    /// Issuing NSM ID
     pub module_id: String,
 
-    // /// The digest function used for calculating the register values
-    // /// Can be: "SHA256" | "SHA512"
+    /// The digest function used for calculating the register values.
     pub digest: Digest,
 
-    /// Time when document was created
+    /// Time when document was created-
     pub timestamp: OffsetDateTime,
 
-    /// Map of all locked PCRs at the moment the attestation document was generated
+    /// Map of all locked PCRs at the moment the attestation document was generated-
     pub pcrs: BTreeMap<usize, ByteBuf>,
 
-    /// An optional DER-encoded key the attestation consumer can use to encrypt data with
+    /// An optional key the attestation consumer can use to encrypt data with-
     pub public_key: Option<ByteBuf>,
 
     /// Additional signed user data, as defined by protocol.
@@ -125,23 +119,35 @@ pub enum Error {
 
     #[error("cose signature verification failed")]
     CoseSignatureVerificationFailed(),
+
+    #[error("cose timestamp invalid")]
+    CoseTimestampInvalid {
+        #[source]
+        source: ::time::error::ComponentRange,
+        timestamp: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Debug)]
 struct Cert<'a> {
     cert: &'a [u8],
     idx: usize,
     x509: X509Certificate<'a>,
 }
 
-impl<'a> AsRef<[u8]> for Cert<'a> {
+impl AsRef<[u8]> for Cert<'_> {
     fn as_ref(&self) -> &[u8] {
         self.cert
     }
 }
 
 impl<'a> Cert<'a> {
+    const ROOT_FINGERPRINT: &'static [u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/root.pem.sha256"));
+
+    /// Get the common name of the certificate.
     fn cn(&'a self) -> Result<&'a str> {
         let cn = self
             .x509
@@ -155,11 +161,17 @@ impl<'a> Cert<'a> {
         Ok(cn)
     }
 
-    // TODO: move root here
+    /// Calculate the SHA256 fingerprint of the certificate.
     fn fingerprint(&self) -> ring::digest::Digest {
         digest::digest(&SHA256, self.cert)
     }
 
+    /// Check if the certificate is the root certificate by comparing fingerprints.
+    fn is_root(&self) -> bool {
+        self.fingerprint().as_ref() == Self::ROOT_FINGERPRINT
+    }
+
+    /// Parse the certificate from DER encoded bytes.
     fn parse(cert: &'a [u8], idx: usize) -> Result<Self> {
         let (_, x509) = X509Certificate::from_der(cert).map_err(|e| match e {
             x509_parser::nom::Err::Incomplete(_) => Error::CertificateMalformed {
@@ -193,7 +205,7 @@ impl<'a> Cert<'a> {
         self.x509.public_key()
     }
 
-    fn validate(&self, now: OffsetDateTime) -> Result<()> {
+    fn validate(self, now: OffsetDateTime) -> Result<Self> {
         let not_after = self.x509.validity.not_after.to_datetime();
 
         if now > not_after {
@@ -216,14 +228,28 @@ impl<'a> Cert<'a> {
             });
         }
 
-        Ok(())
+        Ok(self)
     }
 
-    fn verify(&self, parent: Option<&Cert>) -> Result<()> {
+    /// Verify the certificate by checking the signature of the parent certificate or
+    /// by checking is_root() for root certificates.
+    fn verify(self, parent: Option<&Cert>) -> Result<Self> {
+        // TODO: potentially return verified cert variant - expose tracing fields in struct itself
+
         let cn = self.cn()?;
-        let cert = self.cert;
+        let cert = hex::encode(self.cert); // we use hex to make it simpler to copy & paste when logging via console.log
         let idx = self.idx;
 
+        // ensure algorithm before doing signature checks
+        let alg = self.x509.signature_algorithm.oid();
+
+        if alg != &OID_SIG_ECDSA_WITH_SHA384 {
+            return Err(Error::CertificateUnexpectedAlgorithm {
+                cn: cn.into(),
+                idx,
+                oid: alg.to_owned(),
+            });
+        }
         match parent {
             Some(parent) => {
                 debug!(
@@ -235,7 +261,6 @@ impl<'a> Cert<'a> {
                 );
 
                 // TODO: test what happens if no signature and / or public key is present
-
                 self.x509
                     .verify_signature(Some(parent.public_key()))
                     .map_err(|e| Error::CertificateSignatureInvalid {
@@ -250,19 +275,16 @@ impl<'a> Cert<'a> {
                     cn, idx, "validating root certificate by embedded fingerprint"
                 );
 
-                let want = ROOT_FINGERPRINT;
-                let have = self.fingerprint(); // TODO: fix usage of contents equivalent
-
-                if have.as_ref() != want {
+                if !self.is_root() {
                     return Err(Error::CertificateRootInvalid {
-                        have: hex::encode(have.as_ref()),
-                        want: hex::encode(want),
+                        have: hex::encode(self.fingerprint().as_ref()),
+                        want: hex::encode(Self::ROOT_FINGERPRINT),
                     });
                 }
             }
         }
 
-        Ok(())
+        Ok(self)
     }
 }
 
@@ -275,159 +297,7 @@ impl<'a> From<&'a [u8]> for UnparsedAttestationDoc<'a> {
 }
 
 impl UnparsedAttestationDoc<'_> {
-    /// Convert a bundle of DER encoded certificates and a DER encoded leaf certificate into a vector of
-    /// X509Certificate objects.
-    fn parse_certificates<'a>(
-        cabundle: &'a [ByteBuf],
-        cert: &'a ByteBuf,
-    ) -> Result<Vec<X509Certificate<'a>>> {
-        let bundle = cabundle
-            .iter()
-            .chain(once(cert))
-            .enumerate()
-            .map(|(idx, cert)| {
-                let (_, x509) = X509Certificate::from_der(cert).map_err(|e| match e {
-                    x509_parser::nom::Err::Incomplete(_) => Error::CertificateMalformed {
-                        idx,
-                        incomplete: true,
-                        source: None,
-                    },
-                    x509_parser::nom::Err::Error(e) => Error::CertificateMalformed {
-                        idx,
-                        incomplete: false,
-                        source: Some(e),
-                    },
-                    x509_parser::nom::Err::Failure(e) => Error::CertificateMalformed {
-                        idx,
-                        incomplete: false,
-                        source: Some(e),
-                    },
-                })?;
-
-                // validate integrity before any other checks
-                let mut logger = VecLogger::default();
-
-                // validate integrity before any other checks
-                let mut logger = VecLogger::default();
-                let ok = X509StructureValidator.validate(&x509, &mut logger);
-
-                if !ok {
-                    return Err(Error::CertificateMalformedStructure { idx, logger });
-                }
-
-                Ok(x509)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(bundle)
-    }
-
-    fn parse_cn<'a>(x509: &'a X509Certificate) -> Result<&'a str> {
-        let cn = x509
-            .subject()
-            .iter_common_name()
-            .next()
-            .ok_or(Error::CommonNameMissing)?;
-
-        let cn = cn.as_str().map_err(Error::CommonNameMalformed)?;
-
-        Ok(cn)
-    }
-
-    fn verify_certificate_signature(
-        parent: Option<&X509Certificate>,
-        x509: &X509Certificate,
-        idx: usize,
-    ) -> Result<()> {
-        // ensure algorithm before doing signature checks
-        let alg = x509.signature_algorithm.oid();
-
-        if alg != &OID_SIG_ECDSA_WITH_SHA384 {
-            return Err(Error::CertificateUnexpectedAlgorithm {
-                cn: Self::parse_cn(&x509)?.into(),
-                idx,
-                oid: alg.to_owned(),
-            });
-        }
-
-        // we use hex to make it simpler to copy & paste when logging via console.log
-        let cert = hex::encode(x509.as_ref());
-        let cn = Self::parse_cn(&x509)?; // TODO: flag this in trace keys
-
-        match parent {
-            Some(parent) => {
-                let parent_cn = Self::parse_cn(&parent)?;
-
-                debug!(
-                    cert = cert,
-                    cn = debug(cn),
-                    parent_cn = debug(parent_cn),
-                    idx = idx,
-                    "validating certificate by parent signature"
-                );
-
-                // TODO: test what happens if no signature and / or public key is present
-                x509.verify_signature(Some(parent.public_key()))
-                    .map_err(|e| Error::CertificateSignatureInvalid {
-                        cn: cn.into(),
-                        idx,
-                        source: e,
-                    })?;
-            }
-            None => {
-                debug!(
-                    cert,
-                    cn = debug(cn),
-                    idx,
-                    "validating root certificate by embedded fingerprint"
-                );
-
-                // let want = ROOT_FINGERPRINT;
-                // let have = digest::digest(&SHA256, x509.as_ref()); // TODO: fix usage of contents equivalent
-
-                // if have.as_ref() != want {
-                //     return Err(Error::CertificateRootInvalid {
-                //         have: hex::encode(have.as_ref()),
-                //         want: hex::encode(want),
-                //     });
-                // }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn verify_certificate_validity(
-        x509: &X509Certificate,
-        idx: usize,
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        let not_after = x509.validity.not_after.to_datetime();
-
-        if now > not_after {
-            return Err(Error::CertificateExpired {
-                cn: Self::parse_cn(x509)?.into(),
-                idx,
-                now,
-                then: not_after,
-            });
-        }
-
-        let not_before = x509.validity.not_before.to_datetime();
-
-        if now < not_before {
-            return Err(Error::CertificateNotYetValid {
-                cn: Self::parse_cn(x509)?.into(),
-                idx,
-                now,
-                then: not_before,
-            });
-        }
-
-        Ok(())
-    }
-
-    pub fn parse_and_verify<'a>(&'a self, now: OffsetDateTime) -> Result<AttestationDoc> {
+    pub fn parse_and_verify(&self, now: OffsetDateTime) -> Result<AttestationDoc> {
         let document = CoseSign1::from_slice(self.0).map_err(Error::CoseSignatureMalformed)?;
 
         let payload = document.payload.as_ref().ok_or(Error::CosePayloadMissing)?;
@@ -443,19 +313,21 @@ impl UnparsedAttestationDoc<'_> {
         // verify offline by inspecting with openssl (e.g. xxd -r -p | openssl x509 -inform DER -text -noout)
         debug!("decode and verify certificates");
 
-        let certs = Self::parse_certificates(&doc.cabundle, &doc.certificate)?;
+        let certs = doc
+            .cabundle
+            .iter()
+            .chain(once(&doc.certificate))
+            .enumerate()
+            .map(|(idx, cert)| Cert::parse(cert, idx))
+            .collect::<Result<Vec<_>>>()?;
 
         let cert = certs
             .into_iter()
-            .enumerate()
-            .try_fold::<Option<X509Certificate>, _, Result<_>>(None, |parent, (idx, x509)| {
-                Self::verify_certificate_signature(parent.as_ref(), &x509, idx)?;
-                Self::verify_certificate_validity(&x509, idx, now)?;
-                std::fs::write(format!("{}.der", idx), x509.as_ref()).unwrap();
+            .try_fold::<Option<Cert>, _, Result<_>>(None, |parent, cert| {
+                let cert = cert.verify(parent.as_ref())?;
+                let cert = cert.validate(now)?;
 
-                println!("wrote {}.der", idx);
-
-                Ok(Some(x509))
+                Ok(Some(cert))
             })?
             .ok_or(Error::NoCertificatesFound)?;
 
@@ -472,6 +344,14 @@ impl UnparsedAttestationDoc<'_> {
                 .map_err(|_| Error::CoseSignatureVerificationFailed())
         })?;
 
+        let timestamp = doc.timestamp / 1000;
+        let timestamp = OffsetDateTime::from_unix_timestamp(timestamp as i64).map_err(|e| {
+            Error::CoseTimestampInvalid {
+                source: e,
+                timestamp: doc.timestamp,
+            }
+        })?;
+
         let doc = AttestationDoc {
             module_id: doc.module_id,
             digest: match doc.digest {
@@ -479,7 +359,7 @@ impl UnparsedAttestationDoc<'_> {
                 aws_nitro_enclaves_nsm_api::api::Digest::SHA384 => Digest::SHA384,
                 aws_nitro_enclaves_nsm_api::api::Digest::SHA512 => Digest::SHA512,
             },
-            timestamp: OffsetDateTime::from_unix_timestamp(doc.timestamp as i64).unwrap(), // TODO: add an error
+            timestamp,
             pcrs: doc.pcrs,
             public_key: doc.public_key,
             user_data: doc.user_data,
@@ -494,29 +374,177 @@ impl UnparsedAttestationDoc<'_> {
 mod tests {
 
     use super::*;
+    use ::time::Duration;
+    use rcgen::{CertificateParams, DnType, KeyPair};
 
-    fn init() -> () {}
+    const C0: &[u8] = include_bytes!("../tests/fixtures/0.der");
+    const C1: &[u8] = include_bytes!("../tests/fixtures/1.der");
+    const C2: &[u8] = include_bytes!("../tests/fixtures/2.der");
+    const C3: &[u8] = include_bytes!("../tests/fixtures/3.der");
+    const C4: &[u8] = include_bytes!("../tests/fixtures/4.der");
+
+    fn cert(params: &CertificateParams) -> Result<Cert<'static>> {
+        let keypair = KeyPair::generate().unwrap();
+        let cert = params.clone().self_signed(&keypair).unwrap();
+        let der = Box::leak(cert.der().to_vec().into_boxed_slice());
+
+        Cert::parse(der, 0)
+    }
+
+    fn certs() -> Vec<Cert<'static>> {
+        [C0, C1, C2, C3, C4]
+            .iter()
+            .enumerate()
+            .map(|(idx, cert)| Cert::parse(cert, idx))
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
 
     #[test]
-    fn test_parse_ca() {
+    fn test_cn() {
+        let certs = certs();
+        assert_eq!(certs[0].cn().unwrap(), "aws.nitro-enclaves");
+        assert_eq!(
+            certs[1].cn().unwrap(),
+            "4c2ecc4dee288943.eu-central-1.aws.nitro-enclaves"
+        );
+        assert_eq!(
+            certs[2].cn().unwrap(),
+            "edbf01d65003f42f.zonal.eu-central-1.aws.nitro-enclaves"
+        );
+        assert_eq!(
+            certs[3].cn().unwrap(),
+            "i-0bee92034f3d60691.eu-central-1.aws.nitro-enclaves"
+        );
+        assert_eq!(
+            certs[4].cn().unwrap(),
+            "i-0bee92034f3d60691-enc01943c5eaab3ad6a.eu-central-1.aws"
+        );
 
-        // let cert= X509Certificate {
-        //     tbs_certificate: TbsCertificate {}
-        // }:
+        let mut params = CertificateParams::default();
+        params.distinguished_name.remove(DnType::CommonName);
 
-        // // TODO: add entire bundle from attestation.cose
+        let c = cert(&params).unwrap();
+        let cn = c.cn();
 
-        // let cabundle = vec![];
+        match cn.unwrap_err() {
+            Error::CommonNameMissing => (),
+            e => panic!("{}", e),
+        }
+    }
 
-        // let cert = ByteBuf::from(CERTIFICATE);
+    #[test]
+    fn test_fingerprint() {
+        let certs = certs();
 
-        // let certs = UnparsedAttestationDoc::parse_certificates(&cabundle, &cert).unwrap();
+        assert_eq!(
+            certs[0].fingerprint().as_ref(),
+            ring::test::from_hex(
+                "641A0321A3E244EFE456463195D606317ED7CDCC3C1756E09893F3C68F79BB5B"
+            )
+            .unwrap()
+        );
+    }
 
-        // assert_eq!(certs.len(), 1);
-        // assert_eq!(certs[0].subject().to_string(), "C=US, ST=Washington, L=Seattle, O=Amazon, OU=AWS, CN=i-0bee92034f3d60691-enc01943c5eaab3ad6a.eu-central-1.aws");
-        // assert_eq!(
-        //     UnparsedAttestationDoc::parse_cn(&certs[0]).unwrap(),
-        //     "i-0bee92034f3d60691-enc01943c5eaab3ad6a.eu-central-1.aws"
-        // );
+    #[test]
+    fn test_is_root() {
+        let certs = certs();
+
+        assert!(certs[0].is_root());
+
+        for cert in &certs[1..] {
+            assert!(!cert.is_root());
+        }
+    }
+
+    #[test]
+    fn test_parse() {
+        let params = CertificateParams::default();
+        let c = cert(&params).unwrap();
+
+        let der = c.cert.to_vec();
+
+        match Cert::parse(der[0..0].as_ref(), 0).unwrap_err() {
+            Error::CertificateMalformed {
+                idx,
+                incomplete,
+                source,
+            } => {
+                assert_eq!(idx, 0);
+                assert_eq!(incomplete, true);
+                assert!(source.is_none());
+            }
+            e => panic!("{}", e),
+        }
+
+        match Cert::parse(der[0..10].as_ref(), 0).unwrap_err() {
+            Error::CertificateMalformed {
+                idx,
+                incomplete,
+                source,
+            } => {
+                assert_eq!(idx, 0);
+                assert_eq!(incomplete, false);
+                assert!(source.is_some());
+            }
+            e => panic!("{}", e),
+        }
+    }
+
+    #[test]
+    fn test_validate() {
+        let now = OffsetDateTime::now_utc();
+        let then = now + Duration::seconds(10);
+
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(DnType::CommonName, "foo");
+        params.not_before = then;
+
+        let c = cert(&params).unwrap();
+
+        match c.validate(now).unwrap_err() {
+            Error::CertificateNotYetValid { cn, idx, now, then } => {
+                assert_eq!(cn, "foo");
+                assert_eq!(idx, 0);
+                assert_eq!(now, now);
+                assert_eq!(then, then);
+            }
+            e => panic!("{}", e),
+        }
+
+        params.not_before = now;
+        params.not_after = now;
+
+        let c = cert(&params).unwrap();
+
+        match c.validate(now).unwrap_err() {
+            Error::CertificateExpired { cn, idx, now, then } => {
+                assert_eq!(cn, "foo");
+                assert_eq!(idx, 0);
+                assert_eq!(now, now);
+                assert_eq!(then, then);
+            }
+            e => panic!("{}", e),
+        }
+    }
+
+    #[test]
+    fn test_verify() {
+        let certs = certs();
+
+        assert!(certs[0].clone().verify(None).is_ok());
+
+        match certs[1].clone().verify(None).unwrap_err() {
+            Error::CertificateRootInvalid { .. } => {}
+            e => panic!("{}", e),
+        }
+
+        match certs[2].clone().verify(Some(&certs[0])).unwrap_err() {
+            Error::CertificateSignatureInvalid { cn, idx, .. } => {
+                assert_eq!(cn, "edbf01d65003f42f.zonal.eu-central-1.aws.nitro-enclaves");
+                assert_eq!(idx, 2);
+            }
+            e => panic!("{}", e),
+        }
     }
 }

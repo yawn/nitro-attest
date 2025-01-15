@@ -6,7 +6,7 @@ It performs the following verifications, following the guidance in [AWS Nitro En
 
 - Verify root certificate fingerprint is correct, using the official G1 certificate bundle (see `build.rs` for bootstrapping)
 - Verify certificate chain signatures
-- Verify usage of correct signing algorithm (pinned to `ECDSA_WITH_SHA384`)
+- Verify usage of correct signing algorithm (pinned to `ECDSA_WITH_SHA384`) for certificate chain
 - Verify validity fields (not before, not after)
 - Verify COSE signature
 

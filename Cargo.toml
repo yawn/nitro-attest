@@ -8,6 +8,9 @@ ring = { version = "0.17", features = ["std"] }
 x509-parser = { version = "0.16" }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+rcgen = { version = "0.13", features = ["crypto"] }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
@@ -16,6 +19,7 @@ aws-nitro-enclaves-nsm-api = { version = "0.4", default-features = false }
 coset = { version = "0.3", features = ["std"] }
 hex = "0.4.3"
 ring = "0.17"
+serde_bytes = "0.11"
 serde_cbor = "0.11"
 thiserror = "2"
 time = "0.3"
