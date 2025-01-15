@@ -1,5 +1,7 @@
 # nitro-attest
 
+[![Rust](https://github.com/yawn/nitro-attest/actions/workflows/rust.yml/badge.svg)](https://github.com/yawn/nitro-attest/actions/workflows/rust.yml)
+
 Attestation document parser and verifier for AWS Nitro Enclaves. Tested to work also in `wasm32-unknown-unknown`.
 
 It performs the following verifications, following the guidance in [AWS Nitro Enclaves documentation](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html#validation-process):
