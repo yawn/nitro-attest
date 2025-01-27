@@ -3,11 +3,10 @@ pub use serde_bytes::ByteBuf;
 use ::time::OffsetDateTime;
 use coset::{CborSerializable, CoseError, CoseSign1};
 use ring::{
-    digest::{self, SHA256},
+    digest::{self, Algorithm, SHA256, SHA384, SHA512},
     signature::{UnparsedPublicKey, ECDSA_P384_SHA384_FIXED},
 };
-use std::collections::BTreeMap;
-use std::iter::once;
+use std::{collections::BTreeMap, iter::once};
 use thiserror::Error;
 use tracing::debug;
 use x509_parser::{
@@ -17,26 +16,16 @@ use x509_parser::{
     validate::X509StructureValidator,
 };
 
-#[derive(Debug, PartialEq)]
-pub enum Digest {
-    SHA256,
-    SHA384,
-    SHA512,
-}
-
 #[derive(Debug)]
 pub struct AttestationDoc {
     /// Issuing NSM ID
     pub module_id: String,
 
-    /// The digest function used for calculating the register values.
-    pub digest: Digest,
-
     /// Time when document was created-
     pub timestamp: OffsetDateTime,
 
     /// Map of all locked PCRs at the moment the attestation document was generated-
-    pub pcrs: BTreeMap<usize, ByteBuf>,
+    pub pcrs: BTreeMap<u16, Digest>,
 
     /// An optional key the attestation consumer can use to encrypt data with-
     pub public_key: Option<ByteBuf>,
@@ -47,6 +36,12 @@ pub struct AttestationDoc {
     /// An optional cryptographic nonce provided by the attestation consumer as a proof of
     /// authenticity.
     pub nonce: Option<ByteBuf>,
+}
+
+#[derive(Debug)]
+pub struct Digest {
+    pub algorithm: &'static Algorithm,
+    pub value: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -206,12 +201,15 @@ impl<'a> Cert<'a> {
     }
 
     fn validate(self, now: OffsetDateTime) -> Result<Self> {
+        let cn = self.cn()?.into();
+        let idx = self.idx;
+
         let not_after = self.x509.validity.not_after.to_datetime();
 
         if now > not_after {
             return Err(Error::CertificateExpired {
-                cn: self.cn()?.into(),
-                idx: self.idx,
+                cn,
+                idx,
                 now,
                 then: not_after,
             });
@@ -221,8 +219,8 @@ impl<'a> Cert<'a> {
 
         if now < not_before {
             return Err(Error::CertificateNotYetValid {
-                cn: self.cn()?.into(),
-                idx: self.idx,
+                cn,
+                idx,
                 now,
                 then: not_before,
             });
@@ -265,7 +263,7 @@ impl<'a> Cert<'a> {
                     .verify_signature(Some(parent.public_key()))
                     .map_err(|e| Error::CertificateSignatureInvalid {
                         cn: cn.into(),
-                        idx: self.idx,
+                        idx,
                         source: e,
                     })?;
             }
@@ -352,18 +350,34 @@ impl UnparsedAttestationDoc<'_> {
             }
         })?;
 
+        let alg = match doc.digest {
+            aws_nitro_enclaves_nsm_api::api::Digest::SHA256 => &SHA256,
+            aws_nitro_enclaves_nsm_api::api::Digest::SHA384 => &SHA384,
+            aws_nitro_enclaves_nsm_api::api::Digest::SHA512 => &SHA512,
+        };
+
+        let pcrs = doc
+            .pcrs
+            .into_iter()
+            .filter(|(_, digest)| !digest.iter().all(|e| e == &0))
+            .map(|(idx, digest)| {
+                (
+                    idx as u16,
+                    Digest {
+                        algorithm: alg,
+                        value: digest.to_vec(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
         let doc = AttestationDoc {
             module_id: doc.module_id,
-            digest: match doc.digest {
-                aws_nitro_enclaves_nsm_api::api::Digest::SHA256 => Digest::SHA256,
-                aws_nitro_enclaves_nsm_api::api::Digest::SHA384 => Digest::SHA384,
-                aws_nitro_enclaves_nsm_api::api::Digest::SHA512 => Digest::SHA512,
-            },
-            timestamp,
-            pcrs: doc.pcrs,
-            public_key: doc.public_key,
-            user_data: doc.user_data,
             nonce: doc.nonce,
+            pcrs,
+            public_key: doc.public_key,
+            timestamp,
+            user_data: doc.user_data,
         };
 
         Ok(doc)

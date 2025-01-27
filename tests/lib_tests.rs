@@ -1,8 +1,9 @@
-use nitro_attest::{Digest, Error, UnparsedAttestationDoc};
+use nitro_attest::{Error, UnparsedAttestationDoc};
+use ring::digest::SHA384;
 use time::OffsetDateTime;
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test;
-
 #[test]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 fn test_fixture() {
@@ -27,14 +28,16 @@ fn test_fixture() {
     let res = doc.parse_and_verify(now).unwrap();
 
     assert_eq!(res.module_id, "i-0bee92034f3d60691-enc01943c5eaab3ad6a");
-    assert_eq!(res.digest, Digest::SHA384);
-
     assert_eq!(res.timestamp, now);
-    assert_eq!(res.pcrs.len(), 16);
+    assert_eq!(res.pcrs.len(), 5);
 
-    for i in 0..16 {
+    for i in 0..5 {
         assert!(res.pcrs.get(&i).is_some());
-        assert_eq!(res.pcrs.get(&i).unwrap().len(), 48);
+
+        let pcr = res.pcrs.get(&i).unwrap();
+
+        assert_eq!(pcr.algorithm, &SHA384);
+        assert_eq!(pcr.value.len(), 48);
     }
 
     assert!(res.public_key.is_some());
