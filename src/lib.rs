@@ -16,6 +16,9 @@ use x509_parser::{
     validate::X509StructureValidator,
 };
 
+#[cfg(feature = "builder")]
+pub mod builder;
+
 #[derive(Debug)]
 pub struct AttestationDoc {
     /// Issuing NSM ID

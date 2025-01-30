@@ -1,6 +1,6 @@
 [package]
 name = "nitro_attest"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [build-dependencies]
@@ -24,8 +24,14 @@ serde_cbor = "0.11"
 thiserror = "2"
 time = "0.3"
 tracing = "0.1"
+rcgen = { version = "0.13", features = ["crypto"], optional = true }
 x509-parser = { version = "0.16", features = ["verify", "validate"] }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 time = { version = "0.3", features = ["wasm-bindgen"] }
+
+[features]
+default = ["builder"]
+builder = ["rcgen", "uuid"]
