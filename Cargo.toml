@@ -1,7 +1,13 @@
 [package]
-name = "nitro_attest"
-version = "0.2.0"
+authors = ["Joern Barthel <joern@barthel.digital>"]
+categories = ["cryptography", "hardware-support", "wasm"]
+description = "Parse and validate Nitro Enclave attestation documents"
 edition = "2021"
+keywords = ["aws", "aws-nitro", "nitro-enclave", "trusted-computing"]
+license = "MIT"
+name = "nitro_attest"
+repository = "https://github.com/aws-nitro-enclaves/nitro-attest"
+version = "0.2.0"
 
 [build-dependencies]
 ring = { version = "0.17", features = ["std"] }
