@@ -33,5 +33,5 @@ ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 
 [features]
-default = ["builder"]
+default = []
 builder = ["rcgen", "uuid"]
