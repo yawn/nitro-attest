@@ -12,7 +12,7 @@ use zip::ZipArchive;
 
 macro_rules! src {
     () => {
-        "src/AWS_NitroEnclaves_Root-G1.zip"
+        "AWS_NitroEnclaves_Root-G1.zip"
     };
 }
 
