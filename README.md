@@ -31,7 +31,7 @@ println!("{:?}", doc.public_key);
 ```
 ## Usage for testing
 
-When building with the `builder` feature (WIP), the crate can generate synthetic attestation documents for testing purposes.
+When building with the `builder` feature, the crate can generate synthetic attestation documents for testing purposes.
 
 Certificate chains in test attestation documents originate from the "eu-central-1" region. Certificate chains have the following differences when compared to the official certificates:
 
