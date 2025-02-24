@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v4"], optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 time = { version = "0.3", features = ["wasm-bindgen"] }
+uuid = { version = "1", features = ["v4", "js"], optional = true }
 
 [features]
 default = []
