@@ -12,7 +12,7 @@ version = "0.2.0"
 [build-dependencies]
 ring = { version = "0.17", features = ["std"] }
 x509-parser = { version = "0.17" }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "2.3", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", features = ["crypto"] }
